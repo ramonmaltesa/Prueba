@@ -1,145 +1,146 @@
 import streamlit as st
-import requests
 import pandas as pd
 import plotly.express as px
 import pdfplumber
 import re
 
-# --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Gestor Salarial USM", layout="wide")
+# --- CONFIGURACIÓN Y CONSTANTES ---
+st.set_page_config(page_title="Gestión Salarial PRO", layout="wide")
+HORAS_BASE_SEMANAL = 44.0
+HORAS_MENSUALES = (HORAS_BASE_SEMANAL * 52) / 12
 
-# Estilo para mejorar la visualización de métricas
-st.markdown("""
-    <style>
-    [data-testid="stMetricValue"] { font-size: 28px; color: #1f77b4; }
-    .main { background-color: #fafafa; }
-    </style>
-    """, unsafe_allow_html=True)
+def limpiar_clp(texto):
+    if not texto: return 0
+    # Quitar $, puntos, espacios y dejar solo números
+    limpio = re.sub(r'[^\d]', '', texto)
+    return int(limpio) if limpio else 0
 
-def limpiar_monto(texto):
-    if not texto: return 0.0
-    limpio = re.sub(r"[^\d,]", "", texto).replace(",", ".")
-    try:
-        return float(limpio)
-    except:
-        return 0.0
+def extraer_seccion_items(lineas, inicio_ancla, fin_ancla):
+    items = []
+    capturando = False
+    for linea in lineas:
+        if inicio_ancla.upper() in linea.upper():
+            capturando = True
+            continue
+        if fin_ancla.upper() in linea.upper():
+            capturando = False
+            break
+        if capturando:
+            # Buscar patrón: NOMBRE ... $ MONTO
+            match = re.search(r'^(.*?)\s+\$?\s?([\d\.]+)', linea)
+            if match:
+                nombre = match.group(1).strip()
+                monto = limpiar_clp(match.group(2))
+                if monto > 0:
+                    items.append({"nombre": nombre, "monto": monto})
+    return items
 
-# --- LÓGICA DE EXTRACCIÓN ---
-def extraer_datos_pdf(file):
-    datos = {"base": 0, "asig_fijas": 0, "bono": 0, "isapre_uf": 6.32}
-    asig_keys = ["ANTIGUEDAD", "TITULO", "NIVEL", "PROFESIONALES"]
+def clasificar_descuentos(items):
+    categorias = {"AFP": 0, "SALUD": 0, "IMPUESTO": 0, "CESANTIA": 0, "OTROS": 0}
+    for item in items:
+        n = item["nombre"].upper()
+        if "AFP" in n: categorias["AFP"] += item["monto"]
+        elif any(x in n for x in ["SALUD", "ISAPRE", "FONASA"]): categorias["SALUD"] += item["monto"]
+        elif "IMPUESTO" in n: categorias["IMPUESTO"] += item["monto"]
+        elif "CESANTIA" in n: categorias["CESANTIA"] += item["monto"]
+        else: categorias["OTROS"] += item["monto"]
+    return categorias
+
+def procesar_liquidacion(file):
     with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            lineas = page.extract_text().split('\n')
-            for linea in lineas:
-                if "SUELDO BASE" in linea:
-                    datos["base"] = limpiar_monto(linea.split("BASE")[-1])
-                for key in asig_keys:
-                    if key in linea:
-                        datos["asig_fijas"] += limpiar_monto(linea.split("$")[-1] if "$" in linea else linea)
-                if "BONIFICACION USM" in linea:
-                    datos["bono"] = limpiar_monto(linea.split("USM")[-1])
-                if "ISAPRE" in linea and "UF" in linea:
-                    match = re.search(r"([\d,.]+)\s?UF", linea)
-                    if match: datos["isapre_uf"] = limpiar_monto(match.group(1))
-    return datos
-
-@st.cache_data(ttl=3600)
-def get_indicadores():
-    try:
-        data = requests.get("https://mindicador.cl/api").json()
-        return data['uf']['valor'], data['utm']['valor']
-    except: return 38500.0, 67500.0
-
-uf_hoy, utm_hoy = get_indicadores()
+        texto = "\n".join([p.extract_text() for p in pdf.pages])
+    
+    lineas = [l.strip() for l in texto.split('\n') if l.strip()]
+    
+    # 1. Periodo
+    match_periodo = re.search(r"Liquidación de sueldo\s+([A-Za-z]+)\s+(\d{4})", texto, re.I)
+    mes_nombre = match_periodo.group(1) if match_periodo else "Enero"
+    anio = match_periodo.group(2) if match_periodo else "2025"
+    
+    # 2. Totales Ancla
+    h_afectos = limpiar_clp(re.search(r"Total Haberes Afectos:\s+\$?\s?([\d\.]+)", texto, re.I).group(1))
+    # Algunos meses no tienen haberes exentos, manejamos el error
+    try: h_exentos = limpiar_clp(re.search(r"Total Haberes Exentos:\s+\$?\s?([\d\.]+)", texto, re.I).group(1))
+    except: h_exentos = 0
+    
+    d_legales_total = limpiar_clp(re.search(r"Total Descuentos Legales:\s+\$?\s?([\d\.]+)", texto, re.I).group(1))
+    liquido = limpiar_clp(re.search(r"Líquido a pagar:\s+\$?\s?([\d\.]+)", texto, re.I).group(1))
+    
+    # 3. Items Detallados
+    items_legales = extraer_seccion_items(lineas, "Descuentos Legales", "Total Descuentos Legales")
+    desc_clasificados = clasificar_descuentos(items_legales)
+    
+    return {
+        "Periodo": f"{anio}-{mes_nombre}",
+        "Mes_Orden": f"{anio}-{mes_nombre}", # Para ordenar después
+        "Bruto": h_afectos + h_exentos,
+        "Líquido": liquido,
+        "AFP": desc_clasificados["AFP"],
+        "Salud": desc_clasificados["SALUD"],
+        "Impuesto": desc_clasificados["IMPUESTO"],
+        "Otros_Desc": desc_clasificados["OTROS"] + (limpiar_clp(re.search(r"Total Otros Descuentos:\s+\$?\s?([\d\.]+)", texto, re.I).group(1)) if "Total Otros Descuentos" in texto else 0)
+    }
 
 # --- INTERFAZ ---
-st.title("📈 Dashboard Salarial USM")
+st.title("🏦 Dashboard de Gestión Salarial USM")
 
-if 'datos' not in st.session_state:
-    st.session_state.datos = {"base": 2409363, "asig_fijas": 228033, "bono": 0, "isapre_uf": 6.32}
+if 'db' not in st.session_state:
+    st.session_state.db = []
 
-with st.expander("📂 Cargar Liquidación PDF para actualizar valores", expanded=False):
-    archivo = st.file_uploader("Sube tu PDF aquí", type="pdf")
-    if archivo:
-        extracted = extraer_datos_pdf(archivo)
-        st.session_state.datos.update(extracted)
-        st.success("✅ Datos extraídos")
-
-# Inputs en Sidebar
 with st.sidebar:
-    st.header("Configuración de Montos")
-    base = st.number_input("Sueldo Base", value=float(st.session_state.datos["base"]), step=1000.0)
-    asig = st.number_input("Asignaciones Fijas", value=float(st.session_state.datos["asig_fijas"]), step=1000.0)
-    bono = st.number_input("Bono USM", value=float(st.session_state.datos["bono"]), step=1000.0)
-    plan_uf = st.number_input("Plan Isapre (UF)", value=float(st.session_state.datos["isapre_uf"]), step=0.01)
-    apv = st.number_input("APV (Régimen B)", value=0.0, step=5000.0)
+    st.header("📂 Carga Masiva")
+    archivos = st.file_uploader("Subir Liquidaciones (PDF)", type="pdf", accept_multiple_files=True)
+    if st.button("Procesar y Validar"):
+        if archivos:
+            for arc in archivos:
+                data = procesar_liquidacion(arc)
+                # Evitar duplicados
+                st.session_state.db = [d for d in st.session_state.db if d["Periodo"] != data["Periodo"]]
+                st.session_state.db.append(data)
+            st.success(f"{len(archivos)} archivos procesados.")
 
-# --- CÁLCULOS ---
-imponible = base + asig + bono
-tope_afp = 84.3 * uf_hoy
-base_prov = min(imponible, tope_afp)
-desc_afp = base_prov * 0.1127
-desc_cesantia = imponible * 0.006
-salud_7 = base_prov * 0.07
-salud_total = max(salud_7, plan_uf * uf_hoy)
+if st.session_state.db:
+    df = pd.DataFrame(st.session_state.db)
+    df = df.sort_values("Mes_Orden")
+    
+    # --- DASHBOARD MENSUAL ---
+    st.header("📅 Análisis Mensual")
+    ultimo = df.iloc[-1]
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Último Bruto", f"$ {ultimo['Bruto']:,.0f}")
+    col2.metric("Último Líquido", f"$ {ultimo['Líquido']:,.0f}")
+    col3.metric("Valor Hora Bruto", f"$ {(ultimo['Bruto']/HORAS_MENSUALES):,.0f}")
+    col4.metric("Valor Hora Líq.", f"$ {(ultimo['Líquido']/HORAS_MENSUALES):,.0f}")
+    
+    st.divider()
+    
+    # Gráfico Barras: Bruto vs Líquido
+    fig_evol = px.bar(df, x="Periodo", y=["Bruto", "Líquido"], barmode="group",
+                      title="Comparativa Mensual: Bruto vs Líquido",
+                      color_discrete_map={"Bruto": "#3366CC", "Líquido": "#109618"})
+    st.plotly_chart(fig_evol, use_container_width=True)
+    
+    # Gráfico Líneas: Retenciones Legales
+    st.subheader("📉 Evolución de Descuentos Legales")
+    fig_desc = px.line(df, x="Periodo", y=["AFP", "Salud", "Impuesto"], markers=True,
+                       title="Detalle de Retenciones Mensuales")
+    st.plotly_chart(fig_desc, use_container_width=True)
 
-base_tributable = imponible - desc_afp - salud_7 - desc_cesantia - apv
-base_utm = base_tributable / utm_hoy
-if base_utm <= 13.5: f, r = 0, 0
-elif base_utm <= 30: f, r = 0.04, 0.54
-elif base_utm <= 50: f, r = 0.08, 1.74
-else: f, r = 0.135, 4.49
+    # --- DASHBOARD ANUAL ---
+    st.divider()
+    st.header("🗓️ Consolidado Anual")
+    resumen_anual = df.copy()
+    resumen_anual['Año'] = resumen_anual['Periodo'].apply(lambda x: x.split('-')[0])
+    df_anual = resumen_anual.groupby('Año').sum(numeric_only=True).reset_index()
+    
+    c_a1, c_a2, c_a3 = st.columns(3)
+    c_a1.metric("Bruto Anual Acum.", f"$ {df_anual['Bruto'].sum():,.0f}")
+    c_a2.metric("Líquido Anual Acum.", f"$ {df_anual['Líquido'].sum():,.0f}")
+    c_a3.metric("Total Impuestos Año", f"$ {df_anual['Impuesto'].sum():,.0f}")
 
-impuesto = max(0, (base_tributable * f) - (r * utm_hoy))
-anticipo = bono * 0.8583 if bono > 0 else 0
-liquido = (imponible + 3810) - (desc_afp + salud_total + desc_cesantia + impuesto + apv + anticipo)
-
-# --- DESPLIEGUE DE MÉTRICAS ---
-m1, m2, m3 = st.columns(3)
-m1.metric("SUELDO BRUTO", f"$ {imponible:,.0f}")
-m2.metric("SUELDO LÍQUIDO", f"$ {liquido:,.0f}")
-m3.metric("RETENCIÓN IMPUESTOS", f"$ {impuesto:,.0f}")
-
-st.divider()
-
-# --- NUEVA SECCIÓN: GRÁFICOS COMPARATIVOS ---
-st.subheader("📊 Comparativa Mensual")
-col_graf1, col_graf2 = st.columns(2)
-
-with col_graf1:
-    # Gráfico Sueldo Bruto
-    fig_bruto = px.bar(
-        x=["Sueldo Bruto"], 
-        y=[imponible],
-        labels={'x': '', 'y': 'Monto ($)'},
-        title="Sueldo Bruto Mensual",
-        color_discrete_sequence=['#3366CC']
-    )
-    fig_bruto.update_layout(yaxis_range=[0, imponible * 1.2]) # Espacio arriba para mejor vista
-    st.plotly_chart(fig_bruto, use_container_width=True)
-
-with col_graf2:
-    # Gráfico Sueldo Líquido
-    fig_liquido = px.bar(
-        x=["Sueldo Líquido"], 
-        y=[liquido],
-        labels={'x': '', 'y': 'Monto ($)'},
-        title="Sueldo Líquido Mensual",
-        color_discrete_sequence=['#109618']
-    )
-    fig_liquido.update_layout(yaxis_range=[0, imponible * 1.2]) # Misma escala para comparar visualmente
-    st.plotly_chart(fig_liquido, use_container_width=True)
-
-st.divider()
-
-# --- DISTRIBUCIÓN DETALLADA ---
-st.subheader("🎯 ¿Dónde se va tu dinero?")
-df_pie = pd.DataFrame({
-    "Item": ["Líquido", "AFP", "Salud", "Impuesto", "Ahorro/Otros"],
-    "Monto": [liquido, desc_afp, salud_total, impuesto, apv + anticipo]
-})
-fig_pie = px.pie(df_pie, values="Monto", names="Item", hole=0.5, color_discrete_sequence=px.colors.qualitative.Pastel)
-st.plotly_chart(fig_pie, use_container_width=True)
-
-st.caption(f"Cálculos usando UF: ${uf_hoy:,.2f} | UTM: ${utm_hoy:,.0f}")
+    # Tabla Detallada
+    st.subheader("📋 Registro Histórico de Liquidaciones")
+    st.dataframe(df.drop(columns=['Mes_Orden']).style.format({
+        "Bruto": "$ {:,.0f}", "Líquido": "$ {:,.0f}", 
+        "AFP": "$ {:,.0f}", "Salud": "$ {:,.0f
