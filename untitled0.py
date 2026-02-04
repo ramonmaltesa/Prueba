@@ -10,14 +10,22 @@ st.set_page_config(page_title="Dashboard Salarial USM PRO", layout="wide")
 
 def limpiar_monto(texto):
     if not texto: return 0.0
-    # Elimina todo lo que no sea dígito o coma/punto
-    limpio = re.sub(r"[^\d,]", "", texto)
-    # Maneja el formato chileno (puntos para miles, coma para decimales o viceversa)
-    if "," in limpio and "." in limpio:
+    # Eliminar todo lo que no sea número, punto o coma
+    limpio = re.sub(r"[^\d,.]", "", texto)
+    # Si tiene puntos y comas (formato 1.234,56), quitar puntos y cambiar coma por punto
+    if "." in limpio and "," in limpio:
         limpio = limpio.replace(".", "").replace(",", ".")
+    # Si solo tiene coma (formato 1234,56), cambiar por punto
     elif "," in limpio:
         limpio = limpio.replace(",", ".")
-    return float(limpio) if limpio else 0.0
+    # Si tiene puntos como separadores de miles (formato 1.234.567), quitarlos
+    elif limpio.count(".") > 1:
+        limpio = limpio.replace(".", "")
+    
+    try:
+        return float(limpio)
+    except:
+        return 0.0
 
 def extraer_datos_pdf(file):
     texto_completo = ""
@@ -25,22 +33,22 @@ def extraer_datos_pdf(file):
         for page in pdf.pages:
             texto_completo += page.extract_text() + "\n"
     
-    # --- BUSQUEDA CON EXPRESIONES REGULARES FLEXIBLES ---
-    # Busca Mes y Año
+    # --- BUSCADOR DE MES ---
     meses = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
     periodo = "Desconocido"
     for m in meses:
         if m.upper() in texto_completo.upper():
-            anio = re.search(r"202\d", texto_completo)
-            periodo = f"{m} {anio.group(0) if anio else ''}"
+            anio_match = re.search(r"202\d", texto_completo)
+            periodo = f"{m} {anio_match.group(0) if anio_match else ''}"
             break
 
-    # Busca Sueldo Base (ignora símbolos entre la palabra y el número)
-    base_match = re.search(r"SUELDO BASE\s*[:$\s]*([\d\.]+)", texto_completo)
-    # Busca Bono USM
-    bono_match = re.search(r"BONIFICACION USM\s*[:$\s]*([\d\.]+)", texto_completo)
-    # Busca Líquido (Busca el monto más grande al final de la liquidación o cerca de 'PAGAR')
-    liq_match = re.search(r"(TOTAL A PAGAR|ALCANCE LIQUIDO|LIQUIDO A PERCIBIR)\s*[:$\s]*([\d\.]+)", texto_completo, re.IGNORECASE)
+    # --- BUSCADORES FLEXIBLES (Regex) ---
+    # Busca 'SUELDO BASE' seguido de cualquier cosa hasta el número
+    base_match = re.search(r"SUELDO\s+BASE.*?([\d.,]+)", texto_completo, re.IGNORECASE)
+    # Busca 'BONIFICACION USM'
+    bono_match = re.search(r"BONIFICACION\s+USM.*?([\d.,]+)", texto_completo, re.IGNORECASE)
+    # Busca el valor líquido (Acepta 'TOTAL A PAGAR', 'ALCANCE LIQUIDO', 'PAGAR', etc.)
+    liq_match = re.search(r"(TOTAL\s+A\s+PAGAR|ALCANCE\s+L[IÍ]QUIDO|LIQUIDO\s+A\s+PERCIBIR).*?([\d.,]+)", texto_completo, re.IGNORECASE | re.DOTALL)
 
     return {
         "Mes": periodo,
@@ -71,7 +79,7 @@ with st.sidebar:
         if archivos:
             for arc in archivos:
                 datos = extraer_datos_pdf(arc)
-                # Solo agregar si el mes no existe o si queremos actualizarlo
+                # Actualizar si existe, sino agregar
                 st.session_state.historial = [h for h in st.session_state.historial if h["Mes"] != datos["Mes"]]
                 st.session_state.historial.append(datos)
             st.success("¡Datos procesados!")
@@ -81,46 +89,57 @@ with st.sidebar:
         st.rerun()
 
 if not st.session_state.historial:
-    st.info("💡 Sube tus liquidaciones en el panel lateral para comenzar el análisis.")
+    st.info("💡 Sube tus liquidaciones en el panel lateral para comenzar.")
 else:
-    # Ordenar historial por mes (opcional, requiere lógica extra para meses cronológicos)
     df_hist = pd.DataFrame(st.session_state.historial)
     df_hist["Total Bruto"] = df_hist["Bruto Base"] + df_hist["Bono USM"]
     HORAS_MES = 190.6
 
     # --- MÉTRICAS ---
     ultimo = df_hist.iloc[-1]
-    v_h_l = ultimo["Líquido"] / HORAS_MES
-    v_h_b = ultimo["Total Bruto"] / HORAS_MES
+    # Cálculos forzados
+    liq_val = ultimo["Líquido"]
+    bruto_val = ultimo["Total Bruto"]
+    
+    v_h_l = liq_val / HORAS_MES if liq_val > 0 else 0
+    v_h_b = bruto_val / HORAS_MES if bruto_val > 0 else 0
 
-    st.subheader(f"📍 Resumen: {ultimo['Mes']}")
+    st.subheader(f"📍 Resumen Detectado: {ultimo['Mes']}")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sueldo Líquido", f"$ {ultimo['Líquido']:,.0f}")
-    c2.metric("Sueldo Bruto", f"$ {ultimo['Total Bruto']:,.0f}")
+    c1.metric("Sueldo Líquido", f"$ {liq_val:,.0f}")
+    c2.metric("Sueldo Bruto", f"$ {bruto_val:,.0f}")
     c3.metric("V. Hora Líquido", f"$ {v_h_l:,.0f}")
     c4.metric("V. Hora Bruto", f"$ {v_h_b:,.0f}")
 
     # --- GRÁFICOS ---
     st.divider()
-    st.header("📊 Visualización de Datos")
     
-    # 1. Evolución
-    fig_lineas = px.line(df_hist, x="Mes", y=["Total Bruto", "Líquido"], markers=True,
-                         title="Historial de Ingresos", template="plotly_white")
-    st.plotly_chart(fig_lineas, use_container_width=True)
+    # 1. Evolución Histórica
+    fig_evol = px.line(df_hist, x="Mes", y=["Total Bruto", "Líquido"], markers=True,
+                       title="Evolución Bruto vs Líquido", color_discrete_sequence=["#3366CC", "#109618"])
+    st.plotly_chart(fig_evol, use_container_width=True)
 
-    # 2. Barras Comparativas
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.plotly_chart(px.bar(df_hist, x="Mes", y="Total Bruto", title="Bruto por Mes"), use_container_width=True)
-    with col_b:
-        st.plotly_chart(px.bar(df_hist, x="Mes", y="Líquido", title="Líquido por Mes"), use_container_width=True)
+    # 2. Barras de Valor Hora
+    st.subheader("⏱️ Valor Hora por Mes")
+    df_hist["V. Hora Liq"] = df_hist["Líquido"] / HORAS_MES
+    fig_bar = px.bar(df_hist, x="Mes", y="V. Hora Liq", text_auto='.0s',
+                     title="Evolución Valor Hora Líquido ($)", color_discrete_sequence=["#109618"])
+    st.plotly_chart(fig_bar, use_container_width=True)
 
-    # --- TABLA ---
+    # --- TABLA DETALLADA ---
     st.divider()
     st.header("📋 Detalle de Registros")
     df_disp = df_hist.copy()
+    df_disp["V. Hora Bruto"] = df_disp["Total Bruto"] / HORAS_MES
     df_disp["V. Hora Liq"] = df_disp["Líquido"] / HORAS_MES
-    st.dataframe(df_disp.style.format({"Bruto Base": "$ {:,.0f}", "Bono USM": "$ {:,.0f}", "Líquido": "$ {:,.0f}", "Total Bruto": "$ {:,.0f}", "V. Hora Liq": "$ {:,.0f}"}), use_container_width=True)
+    
+    st.dataframe(df_disp.style.format({
+        "Bruto Base": "$ {:,.0f}", 
+        "Bono USM": "$ {:,.0f}", 
+        "Líquido": "$ {:,.0f}", 
+        "Total Bruto": "$ {:,.0f}", 
+        "V. Hora Bruto": "$ {:,.0f}",
+        "V. Hora Liq": "$ {:,.0f}"
+    }), use_container_width=True)
 
-st.caption(f"UF: ${uf_hoy} | UTM: ${utm_hoy}")
+st.caption(f"UF: ${uf_hoy} | UTM: ${utm_hoy} | Basado en 44 hrs semanales")
