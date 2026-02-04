@@ -1,152 +1,145 @@
 import streamlit as st
+import requests
 import pandas as pd
 import plotly.express as px
 import pdfplumber
 import re
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="IA Salarial USM - Dashboard Completo", layout="wide")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="Gestor Salarial USM", layout="wide")
 
-def limpiar_monto_robusto(t):
-    if not t: return 0.0
-    # Eliminar todo lo que no sea dígito o separadores
-    limpio = re.sub(r'[^\d,.]', '', t)
-    
-    # Filtro anti-folios: Si el número es muy largo y no tiene separadores, es un ID
-    solo_numeros = re.sub(r'[^\d]', '', limpio)
-    if len(solo_numeros) > 8 and "." not in limpio and "," not in limpio:
-        return 0.0
+# Estilo para mejorar la visualización de métricas
+st.markdown("""
+    <style>
+    [data-testid="stMetricValue"] { font-size: 28px; color: #1f77b4; }
+    .main { background-color: #fafafa; }
+    </style>
+    """, unsafe_allow_html=True)
 
-    # Normalizar formato decimal
-    if "." in limpio and "," in limpio:
-        limpio = limpio.replace(".", "").replace(",", ".")
-    elif limpio.count(".") > 1:
-        limpio = limpio.replace(".", "")
-    elif "," in limpio:
-        limpio = limpio.replace(",", ".")
-        
+def limpiar_monto(texto):
+    if not texto: return 0.0
+    limpio = re.sub(r"[^\d,]", "", texto).replace(",", ".")
     try:
-        val = float(limpio)
-        return val if val < 15000000 else 0.0 # Límite de seguridad 15M
+        return float(limpio)
     except:
         return 0.0
 
-def extractor_inteligente(texto):
-    datos = {"Mes": "Desconocido", "Base": 0.0, "Bono": 0.0, "Liquido": 0.0}
-    
-    # 1. Identificar Mes
-    meses = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
-             "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
-    for m in meses:
-        if m.upper() in texto.upper():
-            anio = re.search(r"202\d", texto)
-            datos["Mes"] = f"{m} {anio.group(0) if anio else ''}"
-            break
-
-    lineas = texto.split('\n')
-    for linea in lineas:
-        linea_u = linea.upper()
-        numeros = re.findall(r'(\d[\d\.\,]+)', linea)
-        if not numeros: continue
-        
-        # Lógica de asignación por contexto
-        if "SUELDO BASE" in linea_u:
-            datos["Base"] = limpiar_monto_robusto(numeros[-1])
-        elif "ANTICIPO" in linea_u and "USM" in linea_u:
-            # Captura el monto específico del anticipo
-            datos["Bono"] = limpiar_monto_robusto(numeros[-1])
-        elif any(k in linea_u for k in ["TOTAL A PAGAR", "ALCANCE LIQUIDO", "LIQUIDO A PERCIBIR"]):
-            datos["Liquido"] = limpiar_monto_robusto(numeros[-1])
-
+# --- LÓGICA DE EXTRACCIÓN ---
+def extraer_datos_pdf(file):
+    datos = {"base": 0, "asig_fijas": 0, "bono": 0, "isapre_uf": 6.32}
+    asig_keys = ["ANTIGUEDAD", "TITULO", "NIVEL", "PROFESIONALES"]
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            lineas = page.extract_text().split('\n')
+            for linea in lineas:
+                if "SUELDO BASE" in linea:
+                    datos["base"] = limpiar_monto(linea.split("BASE")[-1])
+                for key in asig_keys:
+                    if key in linea:
+                        datos["asig_fijas"] += limpiar_monto(linea.split("$")[-1] if "$" in linea else linea)
+                if "BONIFICACION USM" in linea:
+                    datos["bono"] = limpiar_monto(linea.split("USM")[-1])
+                if "ISAPRE" in linea and "UF" in linea:
+                    match = re.search(r"([\d,.]+)\s?UF", linea)
+                    if match: datos["isapre_uf"] = limpiar_monto(match.group(1))
     return datos
 
-# --- ESTADO DE SESIÓN ---
-if 'historial' not in st.session_state:
-    st.session_state.historial = []
+@st.cache_data(ttl=3600)
+def get_indicadores():
+    try:
+        data = requests.get("https://mindicador.cl/api").json()
+        return data['uf']['valor'], data['utm']['valor']
+    except: return 38500.0, 67500.0
 
-# --- BARRA LATERAL ---
+uf_hoy, utm_hoy = get_indicadores()
+
+# --- INTERFAZ ---
+st.title("📈 Dashboard Salarial USM")
+
+if 'datos' not in st.session_state:
+    st.session_state.datos = {"base": 2409363, "asig_fijas": 228033, "bono": 0, "isapre_uf": 6.32}
+
+with st.expander("📂 Cargar Liquidación PDF para actualizar valores", expanded=False):
+    archivo = st.file_uploader("Sube tu PDF aquí", type="pdf")
+    if archivo:
+        extracted = extraer_datos_pdf(archivo)
+        st.session_state.datos.update(extracted)
+        st.success("✅ Datos extraídos")
+
+# Inputs en Sidebar
 with st.sidebar:
-    st.header("📂 Carga de Datos")
-    archivos = st.file_uploader("Subir Liquidaciones (PDF)", type="pdf", accept_multiple_files=True)
-    if st.button("🚀 Procesar con IA"):
-        if archivos:
-            for arc in archivos:
-                with pdfplumber.open(arc) as pdf:
-                    texto = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
-                res = extractor_inteligente(texto)
-                if res["Liquido"] > 0 or res["Base"] > 0:
-                    # Evitar duplicados por mes
-                    st.session_state.historial = [h for h in st.session_state.historial if h["Mes"] != res["Mes"]]
-                    st.session_state.historial.append(res)
-            st.success("Análisis completado")
-    
-    if st.button("🗑️ Reiniciar Todo"):
-        st.session_state.historial = []
-        st.rerun()
+    st.header("Configuración de Montos")
+    base = st.number_input("Sueldo Base", value=float(st.session_state.datos["base"]), step=1000.0)
+    asig = st.number_input("Asignaciones Fijas", value=float(st.session_state.datos["asig_fijas"]), step=1000.0)
+    bono = st.number_input("Bono USM", value=float(st.session_state.datos["bono"]), step=1000.0)
+    plan_uf = st.number_input("Plan Isapre (UF)", value=float(st.session_state.datos["isapre_uf"]), step=0.01)
+    apv = st.number_input("APV (Régimen B)", value=0.0, step=5000.0)
 
-# --- PANEL PRINCIPAL ---
-st.title("📊 Dashboard de Gestión Salarial USM")
+# --- CÁLCULOS ---
+imponible = base + asig + bono
+tope_afp = 84.3 * uf_hoy
+base_prov = min(imponible, tope_afp)
+desc_afp = base_prov * 0.1127
+desc_cesantia = imponible * 0.006
+salud_7 = base_prov * 0.07
+salud_total = max(salud_7, plan_uf * uf_hoy)
 
-if not st.session_state.historial:
-    st.info("Carga tus liquidaciones en el panel lateral para generar el análisis visual.")
-else:
-    df = pd.DataFrame(st.session_state.historial)
-    df["Bruto"] = df["Base"] + df["Bono"]
-    HORAS_MES = 190.6
-    ultimo = df.iloc[-1]
+base_tributable = imponible - desc_afp - salud_7 - desc_cesantia - apv
+base_utm = base_tributable / utm_hoy
+if base_utm <= 13.5: f, r = 0, 0
+elif base_utm <= 30: f, r = 0.04, 0.54
+elif base_utm <= 50: f, r = 0.08, 1.74
+else: f, r = 0.135, 4.49
 
-    # 1. Métricas de Resumen
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sueldo Líquido", f"$ {ultimo['Liquido']:,.0f}")
-    c2.metric("Bruto (Base + Bono)", f"$ {ultimo['Bruto']:,.0f}")
-    c3.metric("Valor Hora Líq.", f"$ {(ultimo['Liquido']/HORAS_MES):,.0f}")
-    c4.metric("Valor Hora Bruto", f"$ {(ultimo['Bruto']/HORAS_MES):,.0f}")
+impuesto = max(0, (base_tributable * f) - (r * utm_hoy))
+anticipo = bono * 0.8583 if bono > 0 else 0
+liquido = (imponible + 3810) - (desc_afp + salud_total + desc_cesantia + impuesto + apv + anticipo)
 
-    st.divider()
+# --- DESPLIEGUE DE MÉTRICAS ---
+m1, m2, m3 = st.columns(3)
+m1.metric("SUELDO BRUTO", f"$ {imponible:,.0f}")
+m2.metric("SUELDO LÍQUIDO", f"$ {liquido:,.0f}")
+m3.metric("RETENCIÓN IMPUESTOS", f"$ {impuesto:,.0f}")
 
-    # 2. Gráfico de Evolución Temporal (Líneas)
-    st.subheader("📈 Evolución de Ingresos")
-    fig_line = px.line(df, x="Mes", y=["Bruto", "Liquido"], markers=True,
-                       title="Tendencia de Sueldo Bruto vs Líquido",
-                       color_discrete_map={"Bruto": "#3366CC", "Liquido": "#109618"},
-                       template="plotly_white")
-    st.plotly_chart(fig_line, use_container_width=True)
+st.divider()
 
-    # 3. Gráficos Comparativos (Barras)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("🔹 Comparativa Sueldo Bruto")
-        fig_bruto = px.bar(df, x="Mes", y="Bruto", text_auto='.3s',
-                           color_discrete_sequence=['#3366CC'])
-        st.plotly_chart(fig_bruto, use_container_width=True)
-        
-    with col2:
-        st.subheader("🔸 Comparativa Sueldo Líquido")
-        fig_liq = px.bar(df, x="Mes", y="Liquido", text_auto='.3s',
-                         color_discrete_sequence=['#109618'])
-        st.plotly_chart(fig_liq, use_container_width=True)
+# --- NUEVA SECCIÓN: GRÁFICOS COMPARATIVOS ---
+st.subheader("📊 Comparativa Mensual")
+col_graf1, col_graf2 = st.columns(2)
 
-    st.divider()
+with col_graf1:
+    # Gráfico Sueldo Bruto
+    fig_bruto = px.bar(
+        x=["Sueldo Bruto"], 
+        y=[imponible],
+        labels={'x': '', 'y': 'Monto ($)'},
+        title="Sueldo Bruto Mensual",
+        color_discrete_sequence=['#3366CC']
+    )
+    fig_bruto.update_layout(yaxis_range=[0, imponible * 1.2]) # Espacio arriba para mejor vista
+    st.plotly_chart(fig_bruto, use_container_width=True)
 
-    # 4. Tabla de Detalle Mensual
-    st.subheader("📋 Desglose del Historial Procesado")
-    df_display = df.copy()
-    df_display["V. Hora Liq"] = df_display["Liquido"] / HORAS_MES
-    
-    st.dataframe(df_display.style.format({
-        "Base": "$ {:,.0f}", 
-        "Bono": "$ {:,.0f}", 
-        "Liquido": "$ {:,.0f}", 
-        "Bruto": "$ {:,.0f}",
-        "V. Hora Liq": "$ {:,.0f}"
-    }), use_container_width=True)
+with col_graf2:
+    # Gráfico Sueldo Líquido
+    fig_liquido = px.bar(
+        x=["Sueldo Líquido"], 
+        y=[liquido],
+        labels={'x': '', 'y': 'Monto ($)'},
+        title="Sueldo Líquido Mensual",
+        color_discrete_sequence=['#109618']
+    )
+    fig_liquido.update_layout(yaxis_range=[0, imponible * 1.2]) # Misma escala para comparar visualmente
+    st.plotly_chart(fig_liquido, use_container_width=True)
 
-    # 5. Gráfico de Torta (Último Mes)
-    st.subheader(f"🎯 Composición del Sueldo: {ultimo['Mes']}")
-    df_pie = pd.DataFrame({
-        "Concepto": ["Sueldo Base", "Anticipo USM"],
-        "Monto": [ultimo["Base"], ultimo["Bono"]]
-    })
-    fig_pie = px.pie(df_pie, values="Monto", names="Concepto", hole=0.4,
-                     color_discrete_sequence=px.colors.qualitative.Pastel)
-    st.plotly_chart(fig_pie, use_container_width=True)
+st.divider()
+
+# --- DISTRIBUCIÓN DETALLADA ---
+st.subheader("🎯 ¿Dónde se va tu dinero?")
+df_pie = pd.DataFrame({
+    "Item": ["Líquido", "AFP", "Salud", "Impuesto", "Ahorro/Otros"],
+    "Monto": [liquido, desc_afp, salud_total, impuesto, apv + anticipo]
+})
+fig_pie = px.pie(df_pie, values="Monto", names="Item", hole=0.5, color_discrete_sequence=px.colors.qualitative.Pastel)
+st.plotly_chart(fig_pie, use_container_width=True)
+
+st.caption(f"Cálculos usando UF: ${uf_hoy:,.2f} | UTM: ${utm_hoy:,.0f}")
