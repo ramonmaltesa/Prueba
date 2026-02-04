@@ -132,20 +132,32 @@ def extraer_liquidacion_desde_pagina(texto_pagina: str) -> Optional[LiquidacionM
     descuentos_items = []
     
     # Extraer Haberes Afectos
-    haberes_items.extend(extraer_items_seccion(
+    haberes_afectos_dict = extraer_items_seccion(
         lineas, 
         "HABERES AFECTOS", 
         "TOTAL HABERES AFECTOS",
         "haber_afecto"
-    ))
+    )
+    for item in haberes_afectos_dict:
+        haberes_items.append(ItemHaber(
+            nombre=item['nombre'],
+            monto=item['monto'],
+            tipo='haber_afecto'
+        ))
     
     # Extraer Haberes Exentos
-    haberes_items.extend(extraer_items_seccion(
+    haberes_exentos_dict = extraer_items_seccion(
         lineas, 
         "HABERES EXENTOS", 
         "TOTAL HABERES EXENTOS",
         "haber_exento"
-    ))
+    )
+    for item in haberes_exentos_dict:
+        haberes_items.append(ItemHaber(
+            nombre=item['nombre'],
+            monto=item['monto'],
+            tipo='haber_exento'
+        ))
     
     # Extraer Descuentos Legales
     descuentos_legales = extraer_items_seccion(
