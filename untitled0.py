@@ -585,7 +585,7 @@ def main():
                 title="Descuentos Legales por Mes",
                 barmode='stack'
             )
-            fig_desc_mes.update_xaxis(tickangle=-45)
+            fig_desc_mes.update_layout(xaxis_tickangle=-45)
             st.plotly_chart(fig_desc_mes, use_container_width=True)
         
         with col2:
